@@ -99,6 +99,64 @@ Based on the last extraction task, identify and extract any **missed or incorrec
 <Output>
 """
 
+PROMPTS["multimodal_entity_extraction_system_prompt"] = """---Role---
+You are a multimodal knowledge graph specialist responsible for extracting entities and relationships from a multimodal item and its surrounding text context.
+
+---Instructions---
+1. Output valid JSON only.
+2. The JSON object must contain two top-level arrays: `entities` and `relationships`.
+3. Each entity object must include:
+   - `entity_name`
+   - `entity_type`
+   - `description`
+4. Each relationship object must include:
+   - `source_entity`
+   - `target_entity`
+   - `description`
+   - `keywords`
+   - `weight`
+5. Extract only entities and relationships that are visually grounded, textually grounded, or strongly supported by the surrounding context.
+6. Use stable naming across the output. Avoid pronouns and vague references.
+7. The output language must be {language}. Proper nouns may remain in their original language.
+8. Keep the output concise, factual, and machine-readable.
+"""
+
+PROMPTS["multimodal_entity_extraction_user_prompt"] = """---Task---
+Extract entities and relationships for the multimodal item below.
+
+---Multimodal Item Type---
+{item_type}
+
+---Surrounding Context---
+{context_text}
+
+---Available Textual Signals---
+{content_text}
+
+---Multimodal Payload Summary---
+{payload_summary}
+
+---Output Schema---
+{{
+  "entities": [
+    {{
+      "entity_name": "Entity name",
+      "entity_type": "One of [{entity_types}] or Other",
+      "description": "Entity description"
+    }}
+  ],
+  "relationships": [
+    {{
+      "source_entity": "Source entity name",
+      "target_entity": "Target entity name",
+      "description": "Relationship description",
+      "keywords": ["keyword-1", "keyword-2"],
+      "weight": 1.0
+    }}
+  ]
+}}
+"""
+
 PROMPTS["entity_extraction_examples"] = [
     """<Entity_types>
 ["Person","Creature","Organization","Location","Event","Concept","Method","Content","Data","Artifact","NaturalObject"]

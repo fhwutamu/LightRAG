@@ -89,6 +89,7 @@ from lightrag.namespace import NameSpace
 from lightrag.operate import (
     chunking_by_token_size,
     extract_entities,
+    extract_multimodal_entities,
     merge_nodes_and_edges,
     kg_query,
     naive_query,
@@ -320,6 +321,9 @@ class LightRAG:
 
     llm_model_func: Callable[..., object] | None = field(default=None)
     """Function for interacting with the large language model (LLM). Must be set before use."""
+
+    multimodal_entity_extract_func: Callable[..., object] | None = field(default=None)
+    """Optional multimodal extractor used for entity-relation extraction over image/table/equation payloads."""
 
     llm_model_name: str = field(default="gpt-4o-mini")
     """Name of the LLM model used for generating responses."""
@@ -672,6 +676,13 @@ class LightRAG:
                 **self.llm_model_kwargs,
             )
         )
+
+        if self.multimodal_entity_extract_func is not None:
+            self.multimodal_entity_extract_func = priority_limit_async_func_call(
+                self.llm_model_max_async,
+                llm_timeout=self.default_llm_timeout,
+                queue_name="Multimodal LLM func",
+            )(self.multimodal_entity_extract_func)
 
         self._storages_status = StoragesStatus.CREATED
 
@@ -2510,6 +2521,44 @@ class LightRAG:
         """
         loop = always_get_an_event_loop()
         return loop.run_until_complete(self.aquery_data(query, param))
+
+    def extract_multimodal_entities(
+        self,
+        chunks: dict[str, dict[str, Any]],
+        pipeline_status: dict | None = None,
+        pipeline_status_lock=None,
+        llm_response_cache: BaseKVStorage | None = None,
+        text_chunks_storage: BaseKVStorage | None = None,
+    ) -> list:
+        """Synchronous wrapper for multimodal entity extraction."""
+        loop = always_get_an_event_loop()
+        return loop.run_until_complete(
+            self.aextract_multimodal_entities(
+                chunks=chunks,
+                pipeline_status=pipeline_status,
+                pipeline_status_lock=pipeline_status_lock,
+                llm_response_cache=llm_response_cache,
+                text_chunks_storage=text_chunks_storage,
+            )
+        )
+
+    async def aextract_multimodal_entities(
+        self,
+        chunks: dict[str, dict[str, Any]],
+        pipeline_status: dict | None = None,
+        pipeline_status_lock=None,
+        llm_response_cache: BaseKVStorage | None = None,
+        text_chunks_storage: BaseKVStorage | None = None,
+    ) -> list:
+        """Asynchronous multimodal entity extraction entrypoint."""
+        return await extract_multimodal_entities(
+            chunks=chunks,
+            global_config=self.__dict__,
+            pipeline_status=pipeline_status,
+            pipeline_status_lock=pipeline_status_lock,
+            llm_response_cache=llm_response_cache,
+            text_chunks_storage=text_chunks_storage,
+        )
 
     async def aquery_data(
         self,

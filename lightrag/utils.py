@@ -557,6 +557,20 @@ def compute_mdhash_id(content: str, prefix: str = "") -> str:
     return prefix + compute_args_hash(content)
 
 
+def get_embedding_input(record: dict[str, Any]) -> Any:
+    """Resolve the payload to embed for vector storage records.
+
+    `content` remains the human-readable field stored in vector metadata and
+    returned to callers. `embedding_content` is an optional override used only
+    for embedding generation so multimodal pipelines can keep readable chunks
+    while embedding a richer payload such as `{text, image}`.
+    """
+
+    if "embedding_content" in record:
+        return record["embedding_content"]
+    return record["content"]
+
+
 def generate_cache_key(mode: str, cache_type: str, hash_value: str) -> str:
     """Generate a flattened cache key in the format {mode}:{cache_type}:{hash}
 

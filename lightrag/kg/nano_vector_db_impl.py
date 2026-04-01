@@ -10,6 +10,7 @@ import time
 from lightrag.utils import (
     logger,
     compute_mdhash_id,
+    get_embedding_input,
 )
 
 from lightrag.base import BaseVectorStorage
@@ -113,7 +114,7 @@ class NanoVectorDBStorage(BaseVectorStorage):
             }
             for k, v in data.items()
         ]
-        contents = [v["content"] for v in data.values()]
+        contents = [get_embedding_input(v) for v in data.values()]
         batches = [
             contents[i : i + self._max_batch_size]
             for i in range(0, len(contents), self._max_batch_size)

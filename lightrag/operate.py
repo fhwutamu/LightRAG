@@ -3,6 +3,7 @@ from functools import partial
 from pathlib import Path
 
 import asyncio
+import inspect
 import json
 import json_repair
 from typing import Any, AsyncIterator, overload, Literal
@@ -1052,6 +1053,200 @@ async def _process_extraction_result(
     return dict(maybe_nodes), dict(maybe_edges)
 
 
+def _prepare_multimodal_payload_summary(payload: Any) -> str:
+    """Build a compact JSON summary suitable for prompts and cache keys."""
+
+    def _simplify(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {str(k): _simplify(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [_simplify(v) for v in value[:8]]
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            if isinstance(value, str) and len(value) > 240:
+                return value[:240] + "..."
+            return value
+        return str(value)
+
+    try:
+        return json.dumps(_simplify(payload), ensure_ascii=False, sort_keys=True)
+    except Exception:
+        return str(payload)
+
+
+def _normalize_multimodal_keywords(value: Any) -> str:
+    if isinstance(value, list):
+        return ", ".join(str(item).strip() for item in value if str(item).strip())
+    if value is None:
+        return ""
+    return str(value).replace("，", ",").strip()
+
+
+def _parse_multimodal_extraction_response(result: Any) -> dict[str, Any]:
+    if result is None:
+        return {"entities": [], "relationships": []}
+    if isinstance(result, dict):
+        return result
+    if isinstance(result, str):
+        cleaned = remove_think_tags(result).strip()
+        if not cleaned:
+            return {"entities": [], "relationships": []}
+        parsed = json_repair.loads(cleaned)
+        if isinstance(parsed, dict):
+            return parsed
+        raise ValueError(
+            f"Multimodal extractor returned JSON of type {type(parsed).__name__}, expected object"
+        )
+    raise ValueError(
+        f"Unsupported multimodal extractor result type: {type(result).__name__}"
+    )
+
+
+async def _process_multimodal_extraction_result(
+    result: Any,
+    chunk_key: str,
+    timestamp: int,
+    file_path: str = "unknown_source",
+) -> tuple[dict, dict]:
+    parsed = _parse_multimodal_extraction_response(result)
+    maybe_nodes = defaultdict(list)
+    maybe_edges = defaultdict(list)
+
+    for entity in parsed.get("entities", []) or []:
+        entity_name = sanitize_and_normalize_extracted_text(
+            str(entity.get("entity_name", "")),
+            remove_inner_quotes=True,
+        )
+        if not entity_name:
+            continue
+        entity_type = sanitize_and_normalize_extracted_text(
+            str(entity.get("entity_type", "Other")),
+            remove_inner_quotes=True,
+        )
+        entity_type = entity_type.replace(" ", "").lower() or "other"
+        description = sanitize_and_normalize_extracted_text(
+            str(entity.get("description") or entity.get("summary") or f"Entity {entity_name}")
+        )
+        if not description:
+            continue
+        truncated_name = _truncate_entity_identifier(
+            entity_name,
+            DEFAULT_ENTITY_NAME_MAX_LENGTH,
+            chunk_key,
+            "Entity name",
+        )
+        maybe_nodes[truncated_name].append(
+            {
+                "entity_name": truncated_name,
+                "entity_type": entity_type,
+                "description": description,
+                "source_id": chunk_key,
+                "file_path": file_path,
+                "timestamp": timestamp,
+            }
+        )
+
+    for relationship in parsed.get("relationships", []) or []:
+        src_id = sanitize_and_normalize_extracted_text(
+            str(
+                relationship.get("source_entity")
+                or relationship.get("source")
+                or relationship.get("src_id", "")
+            ),
+            remove_inner_quotes=True,
+        )
+        tgt_id = sanitize_and_normalize_extracted_text(
+            str(
+                relationship.get("target_entity")
+                or relationship.get("target")
+                or relationship.get("tgt_id", "")
+            ),
+            remove_inner_quotes=True,
+        )
+        if not src_id or not tgt_id or src_id == tgt_id:
+            continue
+        description = sanitize_and_normalize_extracted_text(
+            str(relationship.get("description", ""))
+        )
+        if not description:
+            continue
+        keywords = _normalize_multimodal_keywords(relationship.get("keywords"))
+        weight = relationship.get("weight", 1.0)
+        try:
+            weight = float(weight)
+        except (TypeError, ValueError):
+            weight = 1.0
+
+        truncated_source = _truncate_entity_identifier(
+            src_id,
+            DEFAULT_ENTITY_NAME_MAX_LENGTH,
+            chunk_key,
+            "Relation entity",
+        )
+        truncated_target = _truncate_entity_identifier(
+            tgt_id,
+            DEFAULT_ENTITY_NAME_MAX_LENGTH,
+            chunk_key,
+            "Relation entity",
+        )
+        maybe_edges[(truncated_source, truncated_target)].append(
+            {
+                "src_id": truncated_source,
+                "tgt_id": truncated_target,
+                "weight": weight,
+                "description": description,
+                "keywords": keywords,
+                "source_id": chunk_key,
+                "file_path": file_path,
+                "timestamp": timestamp,
+            }
+        )
+
+    return dict(maybe_nodes), dict(maybe_edges)
+
+
+async def _call_multimodal_extract_func(
+    use_multimodal_func: callable,
+    user_prompt: str,
+    *,
+    system_prompt: str,
+    multimodal_payload: dict[str, Any],
+    item_type: str,
+    context_text: str,
+    content_text: str,
+):
+    candidate_kwargs = {
+        "multimodal_payload": multimodal_payload,
+        "item_type": item_type,
+        "context_text": context_text,
+        "content_text": content_text,
+    }
+    try:
+        signature = inspect.signature(use_multimodal_func)
+    except (TypeError, ValueError):
+        signature = None
+
+    if signature is None:
+        return await use_multimodal_func(
+            user_prompt,
+            system_prompt=system_prompt,
+            **candidate_kwargs,
+        )
+
+    accepts_var_kwargs = any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    )
+
+    call_kwargs: dict[str, Any] = {}
+    if "system_prompt" in signature.parameters or accepts_var_kwargs:
+        call_kwargs["system_prompt"] = system_prompt
+    for key, value in candidate_kwargs.items():
+        if key in signature.parameters or accepts_var_kwargs:
+            call_kwargs[key] = value
+
+    return await use_multimodal_func(user_prompt, **call_kwargs)
+
+
 async def _rebuild_from_extraction_result(
     text_chunks_storage: BaseKVStorage,
     extraction_result: str,
@@ -1086,6 +1281,124 @@ async def _rebuild_from_extraction_result(
         tuple_delimiter=PROMPTS["DEFAULT_TUPLE_DELIMITER"],
         completion_delimiter=PROMPTS["DEFAULT_COMPLETION_DELIMITER"],
     )
+
+
+async def extract_multimodal_entities(
+    chunks: dict[str, TextChunkSchema],
+    global_config: dict[str, str],
+    pipeline_status: dict = None,
+    pipeline_status_lock=None,
+    llm_response_cache: BaseKVStorage | None = None,
+    text_chunks_storage: BaseKVStorage | None = None,
+) -> list:
+    """Extract entities and relationships from multimodal chunk payloads."""
+
+    if pipeline_status is not None and pipeline_status_lock is not None:
+        async with pipeline_status_lock:
+            if pipeline_status.get("cancellation_requested", False):
+                raise PipelineCancelledException(
+                    "User cancelled during multimodal entity extraction"
+                )
+
+    use_multimodal_func: callable | None = global_config.get(
+        "multimodal_entity_extract_func"
+    )
+    if use_multimodal_func is None:
+        raise ValueError("multimodal_entity_extract_func is required")
+
+    ordered_chunks = list(chunks.items())
+    language = global_config.get("addon_params", {}).get(
+        "language", DEFAULT_SUMMARY_LANGUAGE
+    )
+    entity_types = global_config.get("addon_params", {}).get(
+        "entity_types", DEFAULT_ENTITY_TYPES
+    )
+    processed_chunks = 0
+    total_chunks = len(ordered_chunks)
+
+    async def _process_single_chunk(chunk_key_dp: tuple[str, TextChunkSchema]):
+        nonlocal processed_chunks
+        chunk_key, chunk_dp = chunk_key_dp
+        file_path = chunk_dp.get("file_path", "unknown_source")
+        content_text = str(chunk_dp.get("content", ""))
+        multimodal_payload = chunk_dp.get("multimodal_payload")
+        if not multimodal_payload:
+            logger.warning(
+                f"{chunk_key}: multimodal payload missing, falling back to text extraction"
+            )
+            fallback_result = await extract_entities(
+                chunks={chunk_key: chunk_dp},
+                global_config=global_config,
+                pipeline_status=pipeline_status,
+                pipeline_status_lock=pipeline_status_lock,
+                llm_response_cache=llm_response_cache,
+                text_chunks_storage=text_chunks_storage,
+            )
+            return fallback_result[0]
+
+        item_type = (
+            multimodal_payload.get("item_type")
+            or chunk_dp.get("original_type")
+            or "multimodal"
+        )
+        context_text = str(chunk_dp.get("context_text") or "N/A")
+        payload_summary = _prepare_multimodal_payload_summary(multimodal_payload)
+        system_prompt = PROMPTS["multimodal_entity_extraction_system_prompt"].format(
+            language=language
+        )
+        user_prompt = PROMPTS["multimodal_entity_extraction_user_prompt"].format(
+            item_type=item_type,
+            context_text=context_text,
+            content_text=content_text or "N/A",
+            payload_summary=payload_summary,
+            entity_types=", ".join(entity_types),
+        )
+
+        raw_result = await _call_multimodal_extract_func(
+            use_multimodal_func,
+            user_prompt,
+            system_prompt=system_prompt,
+            multimodal_payload=multimodal_payload,
+            item_type=item_type,
+            context_text=context_text,
+            content_text=content_text,
+        )
+        timestamp = int(time.time())
+        maybe_nodes, maybe_edges = await _process_multimodal_extraction_result(
+            raw_result,
+            chunk_key,
+            timestamp,
+            file_path=file_path,
+        )
+        processed_chunks += 1
+        logger.info(
+            f"Chunk {processed_chunks} of {total_chunks} extracted {len(maybe_nodes)} Ent + {len(maybe_edges)} Rel {chunk_key}"
+        )
+        if pipeline_status is not None and pipeline_status_lock is not None:
+            async with pipeline_status_lock:
+                log_message = (
+                    f"Chunk {processed_chunks} of {total_chunks} extracted "
+                    f"{len(maybe_nodes)} Ent + {len(maybe_edges)} Rel {chunk_key}"
+                )
+                pipeline_status["latest_message"] = log_message
+                pipeline_status["history_messages"].append(log_message)
+        return maybe_nodes, maybe_edges
+
+    chunk_max_async = global_config.get("llm_model_max_async", 4)
+    semaphore = asyncio.Semaphore(chunk_max_async)
+
+    async def _process_with_semaphore(chunk):
+        async with semaphore:
+            if pipeline_status is not None and pipeline_status_lock is not None:
+                async with pipeline_status_lock:
+                    if pipeline_status.get("cancellation_requested", False):
+                        raise PipelineCancelledException(
+                            "User cancelled during multimodal chunk processing"
+                        )
+            return await _process_single_chunk(chunk)
+
+    tasks = [asyncio.create_task(_process_with_semaphore(chunk)) for chunk in ordered_chunks]
+    return await asyncio.gather(*tasks)
 
 
 async def _rebuild_single_entity(

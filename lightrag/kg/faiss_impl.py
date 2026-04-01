@@ -6,7 +6,7 @@ import json
 import numpy as np
 from dataclasses import dataclass
 
-from lightrag.utils import logger, compute_mdhash_id
+from lightrag.utils import logger, compute_mdhash_id, get_embedding_input
 from lightrag.base import BaseVectorStorage
 
 from .shared_storage import (
@@ -129,7 +129,7 @@ class FaissVectorDBStorage(BaseVectorStorage):
             meta["__id__"] = k
             meta["__created_at__"] = current_time
             list_data.append(meta)
-            contents.append(v["content"])
+            contents.append(get_embedding_input(v))
 
         # Split into batches for embedding if needed
         batches = [
